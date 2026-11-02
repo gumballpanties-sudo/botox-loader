@@ -24,9 +24,12 @@
 #include "imgui/imgui_internal.h"
 #include "imgui/imgui_impl_win32.h"
 #include "imgui/imgui_impl_dx11.h"
+#include "imgui/imgui_freetype.h"
 
 #include "core/manualmap.h"
-#include "core/sfpro_bold.hpp"
+#include "core/release.h"
+#include "core/icon_font.hpp"
+#include "core/github_icon.hpp"
 
 namespace
 {
@@ -34,20 +37,28 @@ namespace
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ;
 
     constexpr const char* kBotoxDllName = "botox.dll";
-    constexpr const char* kBotoxUrl = "https://github.com/gumballpanties-sudo/botox/releases/latest/download/botox.dll";
-    constexpr const char* kBotoxRepo = "gumballpanties-sudo/botox";
-    constexpr const wchar_t* kGameExe = L"csgo.exe";
-    constexpr const char* kGameAppId = "4465480";
+
+    struct target_t
+    {
+        const char*    label;
+        const char*    repo;
+        const wchar_t* exe;
+        const char*    bin_subdir;
+        bool           manual_map;
+    };
+
+    constexpr target_t kTargets[] =
+    {
+        { "botox",     "gumballpanties-sudo/botox",     L"csgo.exe",     "",    true  },
+        { "botox tf2", "gumballpanties-sudo/botox-tf2", L"tf_win64.exe", "tf2", false },
+    };
+    constexpr int kTargetCount = (int)(sizeof(kTargets) / sizeof(kTargets[0]));
+
+    enum release_state : LONG { kRelLoading = 0, kRelOffline, kRelMissing, kRelOk };
 
     inline float Approach(float cur, float target, float speed, float dt)
     {
         return cur + (target - cur) * (1.0f - expf(-speed * dt));
-    }
-
-    inline float SmoothStep01(float t)
-    {
-        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-        return t * t * (3.0f - 2.0f * t);
     }
 
     bool FileHasData(const char* path)
@@ -141,13 +152,11 @@ namespace
         return ok;
     }
 
-    bool FetchLatestSha(const char* repo, const char* asset_name, char out_sha[65])
+    release_state FetchRelease(const char* repo, release::asset_info& out)
     {
-        out_sha[0] = 0;
-        if (!repo || !*repo || !asset_name || !*asset_name) return false;
-
+        out = {};
         HINTERNET hInternet = InternetOpenA("botox-loader/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-        if (!hInternet) return false;
+        if (!hInternet) return kRelOffline;
 
         char url[256];
         snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases/latest", repo);
@@ -159,8 +168,11 @@ namespace
         if (!hUrl)
         {
             InternetCloseHandle(hInternet);
-            return false;
+            return kRelOffline;
         }
+
+        DWORD status = 0, status_len = sizeof(status);
+        HttpQueryInfoA(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &status_len, nullptr);
 
         std::string json;
         char buf[4096];
@@ -171,28 +183,9 @@ namespace
         InternetCloseHandle(hUrl);
         InternetCloseHandle(hInternet);
 
-        size_t pos = json.find(asset_name);
-        if (pos == std::string::npos) return false;
-
-        size_t digest_pos = json.find("\"sha256:", pos);
-        if (digest_pos == std::string::npos)
-        {
-            size_t asset_obj = json.rfind('{', pos);
-            if (asset_obj != std::string::npos)
-                digest_pos = json.find("\"sha256:", asset_obj);
-        }
-
-        if (digest_pos != std::string::npos)
-        {
-            digest_pos += 8;
-            if (digest_pos + 64 <= json.size())
-            {
-                memcpy(out_sha, json.data() + digest_pos, 64);
-                out_sha[64] = 0;
-                return true;
-            }
-        }
-        return false;
+        if (status == 404) return kRelMissing;
+        if (status != 200) return kRelOffline;
+        return release::find_asset(json, kBotoxDllName, out) ? kRelOk : kRelMissing;
     }
 
     bool DownloadToFile(const char* url, const char* out_path)
@@ -236,7 +229,7 @@ namespace
         return ok;
     }
 
-    bool GetBotoxBinDir(char* out, size_t cap)
+    bool GetBotoxBinDir(const char* subdir, char* out, size_t cap)
     {
         char ap[MAX_PATH]{};
         if (!GetEnvironmentVariableA("APPDATA", ap, MAX_PATH)) return false;
@@ -245,25 +238,31 @@ namespace
         CreateDirectoryA(base, nullptr);
         snprintf(out, cap, "%s\\bin", base);
         CreateDirectoryA(out, nullptr);
+        if (subdir && *subdir)
+        {
+            const size_t len = strlen(out);
+            snprintf(out + len, cap - len, "\\%s", subdir);
+            CreateDirectoryA(out, nullptr);
+        }
         return true;
     }
 
-    bool EnsureBotoxDll(char* out_path, size_t cap)
+    bool EnsureBotoxDll(const target_t& target, char* out_path, size_t cap, char* err, size_t err_cap)
     {
-        if (FileHasData(kBotoxDllName) && ValidPeFile(kBotoxDllName))
-        {
-            GetFullPathNameA(kBotoxDllName, (DWORD)cap, out_path, nullptr);
-            return true;
-        }
-
         char bin[MAX_PATH]{};
-        if (!GetBotoxBinDir(bin, sizeof(bin))) return false;
+        if (!GetBotoxBinDir(target.bin_subdir, bin, sizeof(bin)))
+        {
+            lstrcpynA(err, "APPDATA not set", (int)err_cap);
+            return false;
+        }
 
         char cached[MAX_PATH * 2]{};
         snprintf(cached, sizeof(cached), "%s\\%s", bin, kBotoxDllName);
 
-        char latest_sha[65] = {};
-        const bool got_sha = FetchLatestSha(kBotoxRepo, kBotoxDllName, latest_sha);
+        release::asset_info info;
+        const release_state rs = FetchRelease(target.repo, info);
+        const bool got_sha = rs == kRelOk && info.sha256.size() == 64;
+        const char* latest_sha = info.sha256.c_str();
 
         if (FileHasData(cached) && ValidPeFile(cached))
         {
@@ -283,11 +282,20 @@ namespace
             }
         }
 
+        if (rs == kRelMissing)
+        {
+            snprintf(err, err_cap, "no %s release on github", target.label);
+            return false;
+        }
+
+        char url[256]{};
+        snprintf(url, sizeof(url), "https://github.com/%s/releases/latest/download/%s", target.repo, kBotoxDllName);
+
         char part[MAX_PATH * 2 + 8]{};
         snprintf(part, sizeof(part), "%s.part", cached);
         DeleteFileA(part);
 
-        if (DownloadToFile(kBotoxUrl, part) && FileHasData(part) && ValidPeFile(part))
+        if (DownloadToFile(url, part) && FileHasData(part) && ValidPeFile(part))
         {
             if (got_sha)
             {
@@ -295,6 +303,7 @@ namespace
                 if (Sha256File(part, downloaded_sha) && _stricmp(downloaded_sha, latest_sha) != 0)
                 {
                     DeleteFileA(part);
+                    lstrcpynA(err, "download sha256 mismatch", (int)err_cap);
                     return false;
                 }
             }
@@ -311,6 +320,7 @@ namespace
             lstrcpynA(out_path, cached, (DWORD)cap);
             return true;
         }
+        snprintf(err, err_cap, "failed to download %s", target.label);
         return false;
     }
 
@@ -651,84 +661,6 @@ namespace
         return true;
     }
 
-    bool LegacyInstalled()
-    {
-        char steamPath[MAX_PATH] = { 0 };
-        DWORD szSteam = sizeof(steamPath);
-        HKEY hSteam = nullptr;
-        if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", 0, KEY_READ, &hSteam) != ERROR_SUCCESS)
-            return false;
-
-        bool found = false;
-        if (RegQueryValueExA(hSteam, "SteamPath", nullptr, nullptr, (LPBYTE)steamPath, &szSteam) == ERROR_SUCCESS)
-        {
-            for (int i = 0; steamPath[i]; ++i)
-                if (steamPath[i] == '/') steamPath[i] = '\\';
-
-            char manifest[MAX_PATH * 2];
-            snprintf(manifest, sizeof(manifest), "%s\\steamapps\\appmanifest_4465480.acf", steamPath);
-            found = GetFileAttributesA(manifest) != INVALID_FILE_ATTRIBUTES;
-        }
-        RegCloseKey(hSteam);
-        return found;
-    }
-
-    bool GetSteamInstallPath(char* out, size_t cap)
-    {
-        if (!out || cap == 0) return false;
-        out[0] = 0;
-        HKEY hSteam = nullptr;
-        if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", 0, KEY_READ, &hSteam) != ERROR_SUCCESS)
-            return false;
-
-        DWORD type = 0, size = (DWORD)cap;
-        bool ok = RegQueryValueExA(hSteam, "SteamPath", nullptr, &type, (LPBYTE)out, &size) == ERROR_SUCCESS;
-        RegCloseKey(hSteam);
-        if (ok)
-        {
-            for (size_t i = 0; out[i]; ++i)
-                if (out[i] == '/') out[i] = '\\';
-        }
-        return ok;
-    }
-
-    bool LaunchSteamApp(const char* appid, const char* extra_args = nullptr)
-    {
-        char steam_dir[MAX_PATH * 2]{};
-        if (!GetSteamInstallPath(steam_dir, sizeof(steam_dir))) return false;
-
-        char command[MAX_PATH * 3]{};
-        snprintf(command, sizeof(command), "\"%s\\steam.exe\" -applaunch %s%s",
-                 steam_dir, appid, (extra_args && *extra_args) ? extra_args : "");
-
-        STARTUPINFOA si{};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-        if (!CreateProcessA(nullptr, command, nullptr, nullptr, FALSE, 0, nullptr, steam_dir, &si, &pi))
-            return false;
-
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        return true;
-    }
-
-    bool LaunchCsgo()
-    {
-        const char* appid = LegacyInstalled() ? "4465480" : "730";
-        const char* extra_args = " -allow_third_party_software";
-        if (LaunchSteamApp(appid, extra_args)) return true;
-
-        char steamUrl[256]{};
-        snprintf(steamUrl, sizeof(steamUrl), "steam://run/%s//-allow_third_party_software/", appid);
-        HINSTANCE res = ShellExecuteA(nullptr, "open", steamUrl, nullptr, nullptr, SW_SHOWDEFAULT);
-        if ((INT_PTR)res <= 32)
-        {
-            snprintf(steamUrl, sizeof(steamUrl), "steam://rungameid/%s", appid);
-            res = ShellExecuteA(nullptr, "open", steamUrl, nullptr, nullptr, SW_SHOWDEFAULT);
-        }
-        return (INT_PTR)res > 32;
-    }
-
     static WORD DllMachine(const char* path)
     {
         HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -885,41 +817,166 @@ namespace
     }
 }
 
-static void DrawGlassText(ImDrawList* dl, ImFont* font, float font_size, const ImVec2& pos, ImU32 col, const char* text, bool shadow = true, bool gloss = true)
-{
-    const int a = (col >> 24) & 0xFF;
-    if (a <= 5) return;
+static ImFont* g_font_ui = nullptr;
+static ImFont* g_font_bold = nullptr;
+static ImFont* g_font_icon = nullptr;
+enum { kIconGithub, kIconClose, kIconMinimize, kIconCount };
+static int g_icon_rect[kIconCount] = { -1, -1, -1 };
 
-    if (shadow)
-    {
-        const ImU32 sh_col = IM_COL32(0, 0, 0, (int)((float)a * 0.45f));
-        dl->AddText(font, font_size, ImVec2(pos.x, pos.y + 1.0f), sh_col, text);
-    }
-    if (gloss)
-    {
-        const ImU32 gl_col = IM_COL32(255, 255, 255, (int)((float)a * 0.20f));
-        dl->AddText(font, font_size, ImVec2(pos.x, pos.y - 0.5f), gl_col, text);
-    }
-    dl->AddText(font, font_size, pos, col, text);
+static const float kCloseIconPoints[] =
+{
+    8.382f, 17.025f, 6.975f, 15.625f, 10.593f, 12.0f, 6.975f, 8.4f, 8.382f, 7.0f, 12.0f, 10.615f,
+    15.593f, 7.0f, 17.0f, 8.4f, 13.382f, 12.0f, 17.0f, 15.625f, 15.593f, 17.025f, 12.0f, 13.41f,
+};
+
+// baseline-minimize moved up from y 19..21 so its bottom sits on the close glyph's bottom
+static const float kMinimizeIconPoints[] = { 6.0f, 15.025f, 18.0f, 15.025f, 18.0f, 17.025f, 6.0f, 17.025f };
+
+constexpr const char* kLoaderRepoUrl = "https://github.com/gumballpanties-sudo/botox-loader";
+
+static float g_dpi = 100.0f;
+static float g_accent[3] = { 129 / 255.0f, 99 / 255.0f, 251 / 255.0f };
+
+static float g_scale = 1.0f;
+static float kBandH, kBottomBandH, kPad, kGap, kItemH, kRounding, kWindowRounding;
+
+static float S(float v) { return v * g_scale; }
+
+static void UpdateMetrics()
+{
+    g_scale = g_dpi / 100.0f;
+    kBandH = ImFloor(S(25.0f));
+    kBottomBandH = ImFloor(S(12.0f));
+    kPad = ImFloor(S(8.0f));
+    kGap = ImFloor(S(6.0f));
+    kItemH = ImFloor(S(24.0f));
+    kRounding = S(3.0f);
+    kWindowRounding = S(5.0f);
 }
 
-static void DrawGlassText(ImDrawList* dl, const ImVec2& pos, ImU32 col, const char* text, bool shadow = true, bool gloss = true)
+static int WindowW() { return (int)ImFloor(S(260.0f)); }
+
+static float ChromeButtonW() { return ImFloor(S(22.0f)); }
+
+static float ChromeButtonX(float right_edge, int index)
 {
-    DrawGlassText(dl, ImGui::GetFont(), ImGui::GetFontSize(), pos, col, text, shadow, gloss);
+    return right_edge - ImFloor(S(4.0f)) - ChromeButtonW() * (float)(index + 1);
 }
 
-static void AddShimmerText(ImDrawList* dl, const ImVec2& pos, const char* text, float alpha = 1.0f)
+static int WindowH()
 {
-    if (!text || !*text || alpha <= 0.001f) return;
+    return (int)(kBandH + kPad + (kPad * 2.0f + kItemH * kTargetCount + kGap * (kTargetCount - 1)) + kPad + kItemH + kPad + kBottomBandH);
+}
 
-    const float t = (float)ImGui::GetTime();
-    float w = 0.5f + 0.5f * std::sin(t * 2.8f);
+static bool ConfigPath(char* out, size_t cap)
+{
+    char ap[MAX_PATH]{};
+    if (!GetEnvironmentVariableA("APPDATA", ap, MAX_PATH)) return false;
+    snprintf(out, cap, "%s\\botox", ap);
+    CreateDirectoryA(out, nullptr);
+    const size_t len = strlen(out);
+    snprintf(out + len, cap - len, "\\loader.cfg");
+    return true;
+}
+
+static void LoadSettings()
+{
+    char path[MAX_PATH * 2]{};
+    FILE* f = nullptr;
+    if (!ConfigPath(path, sizeof(path)) || fopen_s(&f, path, "r") != 0 || !f) return;
+
+    char line[128];
+    while (fgets(line, sizeof(line), f))
+    {
+        float dpi = 0.0f;
+        int r = 0, g = 0, b = 0;
+        if (sscanf_s(line, "dpi=%f", &dpi) == 1)
+            g_dpi = ImClamp(dpi, 25.0f, 200.0f);
+        else if (sscanf_s(line, "accent=%d %d %d", &r, &g, &b) == 3)
+        {
+            g_accent[0] = ImClamp(r, 0, 255) / 255.0f;
+            g_accent[1] = ImClamp(g, 0, 255) / 255.0f;
+            g_accent[2] = ImClamp(b, 0, 255) / 255.0f;
+        }
+    }
+    fclose(f);
+}
+
+static void SaveSettings()
+{
+    char path[MAX_PATH * 2]{};
+    FILE* f = nullptr;
+    if (!ConfigPath(path, sizeof(path)) || fopen_s(&f, path, "w") != 0 || !f) return;
+    fprintf(f, "dpi=%.0f\naccent=%d %d %d\n", g_dpi,
+            (int)(g_accent[0] * 255.0f + 0.5f), (int)(g_accent[1] * 255.0f + 0.5f), (int)(g_accent[2] * 255.0f + 0.5f));
+    fclose(f);
+}
+
+static ImU32 Fade(ImU32 col, float alpha)
+{
+    const ImU32 a = (ImU32)((float)((col >> IM_COL32_A_SHIFT) & 0xFF) * ImClamp(alpha, 0.0f, 1.0f));
+    return (col & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
+}
+
+static void DrawIcon(ImDrawList* dl, int icon, const ImVec2& box_min, const ImVec2& box_size, ImU32 col)
+{
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    const ImFontAtlasCustomRect* r = g_icon_rect[icon] >= 0 ? atlas->GetCustomRectByIndex(g_icon_rect[icon]) : nullptr;
+    if (!r) return;
+
+    ImVec2 uv0, uv1;
+    atlas->CalcCustomRectUV(r, &uv0, &uv1);
+    const float sz = (float)r->Width;
+    const ImVec2 o(ImFloor(box_min.x + (box_size.x - sz) * 0.5f), ImFloor(box_min.y + (box_size.y - sz) * 0.5f));
+    dl->AddImage(atlas->TexID, o, ImVec2(o.x + sz, o.y + sz), uv0, uv1, col);
+}
+
+static ImFont* LoadFont(ImGuiIO& io, const char* file, float size)
+{
+    ImFontConfig cfg;
+    cfg.FontBuilderFlags = g_dpi == 100.0f ? ImGuiFreeTypeBuilderFlags_Monochrome | ImGuiFreeTypeBuilderFlags_MonoHinting
+                                           : ImGuiFreeTypeBuilderFlags_LightHinting;
+
+    char path[MAX_PATH * 2]{};
+    char win[MAX_PATH]{};
+    GetWindowsDirectoryA(win, MAX_PATH);
+    snprintf(path, sizeof(path), "%s\\Fonts\\%s", win, file);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+        if (ImFont* font = io.Fonts->AddFontFromFileTTF(path, size, &cfg))
+            return font;
+
+    cfg.SizePixels = size;
+    return io.Fonts->AddFontDefault(&cfg);
+}
+
+static ImU32 AccentCol(float alpha)
+{
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(g_accent[0], g_accent[1], g_accent[2], ImClamp(alpha, 0.0f, 1.0f)));
+}
+
+static ImU32 TextCol(float hover, float lit)
+{
+    const float a = 0.5f + 0.5f * hover;
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(ImLerp(1.0f, g_accent[0], lit), ImLerp(1.0f, g_accent[1], lit),
+                                                 ImLerp(1.0f, g_accent[2], lit), a + (1.0f - a) * lit));
+}
+
+static void FadedLine(ImDrawList* dl, float x, float y, float w, float alpha)
+{
+    if (alpha <= 0.001f) return;
+    const ImU32 c = AccentCol(alpha);
+    const ImU32 z = AccentCol(0.0f);
+    const float mid = x + w * 0.5f;
+    dl->AddRectFilledMultiColor(ImVec2(x, y), ImVec2(mid, y + 1.0f), z, c, c, z);
+    dl->AddRectFilledMultiColor(ImVec2(mid, y), ImVec2(x + w, y + 1.0f), c, z, z, c);
+}
+
+static void AddShimmerText(ImDrawList* dl, ImFont* font, const ImVec2& pos, const char* text)
+{
+    float w = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 2.8f);
     w = w * w * (3.0f - 2.0f * w);
-    const int a = (int)(240.0f * ImClamp(alpha, 0.0f, 1.0f));
-    const ImU32 col = IM_COL32((int)(145.0f + 101.0f * w),
-                               (int)(149.0f + 99.0f * w),
-                               (int)(158.0f + 94.0f * w), a);
-    dl->AddText(pos, col, text);
+    const ImU32 col = IM_COL32((int)(145.0f + 101.0f * w), (int)(149.0f + 99.0f * w), (int)(158.0f + 94.0f * w), 240);
+    dl->AddText(font, font->FontSize, pos, col, text);
 }
 
 static bool  g_window_dragging = false;
@@ -1018,38 +1075,74 @@ static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 
 static bool g_running = true;
 static bool g_closing = false;
-static float g_fade_alpha = 1.0f;
-static float g_intro_t = 0.0f;
+static float g_fade = 0.0f;
+
+constexpr float kAnimDuration = 0.25f;
+
+static bool g_settings_open = false;
+static float g_settings_fade = 0.0f;
+static bool g_scale_dirty = false;
+
+static int g_target = 0;
+static volatile LONG g_release_state[kTargetCount] = {};
+static char g_release_date[kTargetCount][32] = {};
 
 static bool g_injecting = false;
 static volatile LONG g_inject_state = 0;
+static const char* volatile g_inject_stage = "";
 static char g_inject_err[256] = {};
 static float g_inject_ok_at = 0.0f;
 
-static DWORD WINAPI InjectionWorkerThread(LPVOID)
+static DWORD WINAPI ReleaseInfoThread(LPVOID param)
 {
-    char dll_path[MAX_PATH * 2] = {};
-    if (!EnsureBotoxDll(dll_path, sizeof(dll_path)))
+    const int i = (int)(INT_PTR)param;
+    release::asset_info info;
+    const release_state rs = FetchRelease(kTargets[i].repo, info);
+    if (rs == kRelOk)
+        lstrcpynA(g_release_date[i], release::short_date(info.updated_at).c_str(), (int)sizeof(g_release_date[i]));
+    InterlockedExchange(&g_release_state[i], rs);
+    return 0;
+}
+
+static const char* ReleaseLabel(int i)
+{
+    switch (InterlockedCompareExchange(&g_release_state[i], 0, 0))
     {
-        lstrcpynA(g_inject_err, "failed to download / verify botox.dll", sizeof(g_inject_err));
+    case kRelOk:      return g_release_date[i];
+    case kRelMissing: return "no release";
+    case kRelOffline: return "offline";
+    default:          return "...";
+    }
+}
+
+static DWORD WINAPI InjectionWorkerThread(LPVOID param)
+{
+    const int ti = (int)(INT_PTR)param;
+    const target_t& target = kTargets[ti];
+
+    g_inject_stage = "downloading";
+    char dll_path[MAX_PATH * 2] = {};
+    if (!EnsureBotoxDll(target, dll_path, sizeof(dll_path), g_inject_err, sizeof(g_inject_err)))
+    {
         InterlockedExchange(&g_inject_state, 3);
         return 0;
     }
 
-    DWORD pid = FindProcessId(kGameExe);
+    g_inject_stage = "waiting for game";
+    DWORD pid = FindProcessId(target.exe);
     if (pid == 0)
     {
-        LaunchCsgo();
-        for (int i = 0; i < 900 && pid == 0; ++i)
+        g_inject_stage = "start the game";
+        for (int i = 0; i < 1800 && pid == 0; ++i)
         {
             Sleep(100);
-            pid = FindProcessId(kGameExe);
+            pid = FindProcessId(target.exe);
         }
     }
 
     if (pid == 0)
     {
-        lstrcpynA(g_inject_err, "csgo.exe process not found", sizeof(g_inject_err));
+        snprintf(g_inject_err, sizeof(g_inject_err), "%ls process not found", target.exe);
         InterlockedExchange(&g_inject_state, 3);
         return 0;
     }
@@ -1057,7 +1150,7 @@ static DWORD WINAPI InjectionWorkerThread(LPVOID)
     bool ready = false;
     for (int i = 0; i < 900; ++i)
     {
-        DWORD cur_pid = FindProcessId(kGameExe);
+        DWORD cur_pid = FindProcessId(target.exe);
         if (cur_pid != 0 && cur_pid != pid)
             pid = cur_pid;
 
@@ -1077,9 +1170,10 @@ static DWORD WINAPI InjectionWorkerThread(LPVOID)
     }
 
     Sleep(300);
+    g_inject_stage = "injecting";
 
     char map_err[256] = {};
-    bool ok = ManualMapInject(pid, dll_path, map_err, sizeof(map_err));
+    bool ok = target.manual_map && ManualMapInject(pid, dll_path, map_err, sizeof(map_err));
     if (!ok)
     {
         char std_err[256] = {};
@@ -1087,23 +1181,19 @@ static DWORD WINAPI InjectionWorkerThread(LPVOID)
         {
             ok = true;
         }
-        else
+        else if (target.manual_map)
         {
             snprintf(g_inject_err, sizeof(g_inject_err), "map: %s | std: %s",
                      map_err[0] ? map_err : "failed",
                      std_err[0] ? std_err : "failed");
         }
+        else
+        {
+            snprintf(g_inject_err, sizeof(g_inject_err), "std: %s", std_err[0] ? std_err : "failed");
+        }
     }
 
-    if (ok)
-    {
-        InterlockedExchange(&g_inject_state, 2);
-    }
-    else
-    {
-        InterlockedExchange(&g_inject_state, 3);
-    }
-
+    InterlockedExchange(&g_inject_state, ok ? 2 : 3);
     return 0;
 }
 
@@ -1112,219 +1202,412 @@ static void RequestClose()
     g_closing = true;
 }
 
-static void DrawStatusScreen(HWND hwnd)
+static void DrawChrome(HWND hwnd)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 wpos = ImGui::GetWindowPos();
-    const ImVec2 wsz = ImGui::GetWindowSize();
+    const ImVec2 p = ImGui::GetWindowPos();
+    const ImVec2 s = ImGui::GetWindowSize();
+    const float dt = ImGui::GetIO().DeltaTime;
+    static float s_hover[3] = {};
 
-    HandleWindowDrag(hwnd, ImVec2(0.0f, 0.0f), wsz);
+    dl->AddRectFilled(p, ImVec2(p.x + s.x, p.y + s.y), IM_COL32(10, 10, 10, 255), kWindowRounding);
+    dl->AddRectFilled(p, ImVec2(p.x + s.x, p.y + kBandH), IM_COL32(25, 25, 25, 255), kWindowRounding, ImDrawFlags_RoundCornersTop);
+    FadedLine(dl, p.x, p.y + kBandH - 1.0f, s.x, 1.0f);
+    dl->AddRectFilled(ImVec2(p.x, p.y + s.y - kBottomBandH), ImVec2(p.x + s.x, p.y + s.y), IM_COL32(25, 25, 25, 255),
+                      kWindowRounding, ImDrawFlags_RoundCornersBottom);
+    FadedLine(dl, p.x, p.y + s.y - kBottomBandH, s.x, 1.0f);
+    dl->AddRect(p, ImVec2(p.x + s.x, p.y + s.y), IM_COL32(50, 50, 50, 255), kWindowRounding);
 
-    dl->AddRectFilled(wpos, ImVec2(wpos.x + wsz.x, wpos.y + wsz.y), IM_COL32(0, 0, 0, 255), 0.0f);
+    const char* title = "botox";
+    const char* suffix = " | loader";
+    const ImVec2 ts = g_font_bold->CalcTextSizeA(g_font_bold->FontSize, FLT_MAX, 0.0f, title);
+    const ImVec2 ss = g_font_ui->CalcTextSizeA(g_font_ui->FontSize, FLT_MAX, 0.0f, suffix);
+    const float tx = ImFloor(p.x + (s.x - ts.x - ss.x) * 0.5f);
+    const float ty = ImFloor(p.y + (kBandH - ts.y) * 0.5f);
+    dl->AddText(g_font_bold, g_font_bold->FontSize, ImVec2(tx, ty), IM_COL32(255, 255, 255, 255), title);
+    dl->AddText(g_font_ui, g_font_ui->FontSize, ImVec2(tx + ts.x, ty), AccentCol(1.0f), suffix);
+
+    bool any_hover = false;
+    {
+        static float s_gh_hover = 0.0f;
+        const ImVec2 gmin(p.x + ImFloor(S(4.0f)), p.y);
+        const ImVec2 gmax(gmin.x + ChromeButtonW(), p.y + kBandH - 1.0f);
+        const bool hov = ImGui::IsMouseHoveringRect(gmin, gmax, false);
+        any_hover |= hov;
+        s_gh_hover = Approach(s_gh_hover, hov ? 1.0f : 0.0f, 18.0f, dt);
+
+        const int v = (int)(190.0f + 65.0f * s_gh_hover);
+        DrawIcon(dl, kIconGithub, gmin, ImVec2(ChromeButtonW(), kBandH), IM_COL32(v, v, v, 255));
+
+        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            ::ShellExecuteA(nullptr, "open", kLoaderRepoUrl, nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    for (int i = 0; i < 3; ++i)
+    {
+        const ImVec2 bmin(ChromeButtonX(p.x + s.x, i), p.y);
+        const ImVec2 bmax(bmin.x + ChromeButtonW(), p.y + kBandH - 1.0f);
+        const bool hov = ImGui::IsMouseHoveringRect(bmin, bmax, false);
+        any_hover |= hov;
+        s_hover[i] = Approach(s_hover[i], (hov || (i == 2 && g_settings_open)) ? 1.0f : 0.0f, 18.0f, dt);
+
+        const int v = (int)(190.0f + 65.0f * s_hover[i]);
+        const ImU32 col = IM_COL32(v, v, v, 255);
+        if (i < 2)
+        {
+            DrawIcon(dl, i == 0 ? kIconClose : kIconMinimize, bmin, ImVec2(ChromeButtonW(), kBandH), col);
+        }
+        else
+        {
+            const char* cog = "\xef\x80\x93";
+            const ImVec2 cs = g_font_icon->CalcTextSizeA(g_font_icon->FontSize, FLT_MAX, 0.0f, cog);
+            dl->AddText(g_font_icon, g_font_icon->FontSize,
+                        ImVec2(ImFloor(bmin.x + (ChromeButtonW() - cs.x) * 0.5f), ImFloor(bmin.y + (kBandH - cs.y) * 0.5f)), col, cog);
+        }
+
+        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            if (i == 0) RequestClose();
+            else if (i == 1) ::ShowWindow(hwnd, SW_MINIMIZE);
+            else g_settings_open = !g_settings_open;
+        }
+    }
+
+    HandleWindowDrag(hwnd, ImVec2(0.0f, 0.0f), ImVec2(ChromeButtonX(s.x, 2), kBandH), !any_hover);
+}
+
+static void DrawStatusScreen(HWND hwnd)
+{
+    DrawChrome(hwnd);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetWindowPos();
+    const ImVec2 s = ImGui::GetWindowSize();
 
     const LONG state = InterlockedCompareExchange(&g_inject_state, 0, 0);
-    const char* text = "meowing...";
-    const char* sub = nullptr;
-    ImU32 sub_col = IM_COL32(190, 194, 201, 220);
-    bool shimmer = true;
+    const char* text = g_inject_stage;
+    const char* sub = kTargets[g_target].label;
+    ImU32 sub_col = IM_COL32(120, 120, 120, 255);
+    const bool busy = state == 1;
 
     if (state == 2)
     {
         text = "injected";
-        sub = nullptr;
-        shimmer = false;
-
         if (g_inject_ok_at == 0.0f)
             g_inject_ok_at = (float)ImGui::GetTime();
-
         if ((float)ImGui::GetTime() - g_inject_ok_at > 0.8f)
-        {
             RequestClose();
-        }
     }
     else if (state == 3)
     {
         text = "failed";
         sub = g_inject_err[0] ? g_inject_err : "unknown error";
         sub_col = IM_COL32(230, 110, 110, 240);
-        shimmer = false;
     }
 
-    const ImVec2 ms = ImGui::CalcTextSize(text);
-    const float wrap_w = wsz.x - 30.0f;
-    const bool has_sub = sub && *sub;
+    ImFont* main_font = g_font_bold;
+    const float wrap_w = s.x - S(30.0f);
+    const ImVec2 ms = main_font->CalcTextSizeA(main_font->FontSize, FLT_MAX, 0.0f, text);
+    const ImVec2 dots = busy ? main_font->CalcTextSizeA(main_font->FontSize, FLT_MAX, 0.0f, "...") : ImVec2(0.0f, 0.0f);
+    const ImVec2 ss = g_font_ui->CalcTextSizeA(g_font_ui->FontSize, FLT_MAX, wrap_w, sub);
 
-    ImVec2 ss{};
-    if (has_sub) ss = ImGui::CalcTextSize(sub, nullptr, false, wrap_w);
+    const float gap = S(4.0f);
+    const float body_top = p.y + kBandH;
+    const float top = ImFloor(body_top + (s.y - kBandH - kBottomBandH - (ms.y + gap + ss.y)) * 0.5f);
+    const ImVec2 text_pos(ImFloor(p.x + (s.x - ms.x - dots.x) * 0.5f), top);
 
-    const float gap = has_sub ? 6.0f : 0.0f;
-    const float total_h = ms.y + (has_sub ? gap + ss.y : 0.0f);
-    const float top = wpos.y + (wsz.y - total_h) * 0.5f;
-
-    const ImVec2 text_pos(wpos.x + (wsz.x - ms.x) * 0.5f, top);
-    if (shimmer)
-        AddShimmerText(dl, text_pos, text);
-    else
-        DrawGlassText(dl, text_pos, IM_COL32(245, 245, 245, 255), text, true, false);
-
-    if (has_sub)
+    if (busy)
     {
-        const ImVec2 spos(wpos.x + (wsz.x - ss.x) * 0.5f, top + ms.y + gap);
-        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), spos, sub_col, sub, nullptr, wrap_w);
-    }
-
-    if (state != 1)
-    {
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+        AddShimmerText(dl, main_font, text_pos, text);
+        const float t = (float)ImGui::GetTime();
+        float x = text_pos.x + ms.x;
+        for (int i = 0; i < 3; ++i)
         {
-            if (state == 2)
-            {
-                RequestClose();
-            }
-            else
-            {
-                g_injecting = false;
-                InterlockedExchange(&g_inject_state, 0);
-            }
+            const float a = 0.2f + 0.8f * (0.5f + 0.5f * std::cos((t - (float)i * 0.2f) * 6.2832f / 1.2f));
+            dl->AddText(main_font, main_font->FontSize, ImVec2(x, text_pos.y), IM_COL32(245, 245, 245, (int)(255.0f * a)), ".");
+            x += main_font->CalcTextSizeA(main_font->FontSize, FLT_MAX, 0.0f, ".").x;
+        }
+    }
+    else
+    {
+        dl->AddText(main_font, main_font->FontSize, text_pos, state == 2 ? AccentCol(1.0f) : IM_COL32(245, 245, 245, 255), text);
+    }
+
+    dl->AddText(g_font_ui, g_font_ui->FontSize, ImVec2(ImFloor(p.x + (s.x - ss.x) * 0.5f), top + ms.y + gap),
+                sub_col, sub, nullptr, wrap_w);
+
+    const bool body_click = ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetMousePos().y > body_top;
+    if (!busy && !g_settings_open && (body_click || ImGui::IsKeyPressed(ImGuiKey_Escape)))
+    {
+        if (state == 2)
+        {
+            RequestClose();
+        }
+        else
+        {
+            g_injecting = false;
+            InterlockedExchange(&g_inject_state, 0);
         }
     }
 }
 
 static void DrawGamePanel(HWND hwnd)
 {
+    DrawChrome(hwnd);
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 wpos = ImGui::GetWindowPos();
-    const ImVec2 wsz = ImGui::GetWindowSize();
+    const ImVec2 p = ImGui::GetWindowPos();
+    const ImVec2 s = ImGui::GetWindowSize();
     const float dt = ImGui::GetIO().DeltaTime;
 
-    const float bar_h = 32.0f;
-    const float pad = 10.0f;
-    const float btn_h = 30.0f;
-    const float content_l = wpos.x + pad;
-    const float content_r = wpos.x + wsz.x - pad;
-    const float content_w = content_r - content_l;
-
-    const float card_y = wpos.y + bar_h + 8.0f;
-    const float btn_y = wpos.y + wsz.y - pad - btn_h;
-    const float card_b = btn_y - 8.0f;
-
+    static float s_row_hover[kTargetCount] = {};
+    static float s_row_lit[kTargetCount] = {};
     static float s_btn_hover = 0.0f;
     static float s_btn_press = 0.0f;
-    static float s_close_hover = 0.0f;
-    static float s_close_press = 0.0f;
-    static float s_item_hover = 0.0f;
 
-    dl->AddRectFilled(wpos, ImVec2(wpos.x + wsz.x, wpos.y + wsz.y), IM_COL32(0, 0, 0, 255), 0.0f);
+    const float rounding = kRounding;
+    const float row_h = kItemH;
+    const float btn_h = kItemH;
 
+    const ImVec2 box_min(p.x + kPad, p.y + kBandH + kPad);
+    const ImVec2 box_max(p.x + s.x - kPad, box_min.y + kPad * 2.0f + row_h * (float)kTargetCount + kGap * (float)(kTargetCount - 1));
+    dl->AddRectFilled(box_min, box_max, IM_COL32(15, 15, 15, 255), rounding);
+    dl->AddRect(box_min, box_max, IM_COL32(50, 50, 50, 100), rounding);
+
+    for (int i = 0; i < kTargetCount; ++i)
     {
-        const ImVec2 ts = ImGui::CalcTextSize("botox");
-        DrawGlassText(dl, ImVec2(wpos.x + 14.0f, wpos.y + (bar_h - ts.y) * 0.5f),
-                      IM_COL32(245, 245, 248, 255), "botox", true, false);
+        const ImVec2 rmin(box_min.x + kPad, box_min.y + kPad + (float)i * (row_h + kGap));
+        const ImVec2 rmax(box_max.x - kPad, rmin.y + row_h);
+        const bool hov = !g_settings_open && ImGui::IsMouseHoveringRect(rmin, rmax, false);
 
-        const float close_sz = 16.0f;
-        const ImVec2 close_pos(wpos.x + wsz.x - 12.0f - close_sz, wpos.y + (bar_h - close_sz) * 0.5f);
-        const ImVec2 mouse = ImGui::GetMousePos();
+        s_row_hover[i] = Approach(s_row_hover[i], hov ? 1.0f : 0.0f, 18.0f, dt);
+        s_row_lit[i] = Approach(s_row_lit[i], i == g_target ? 1.0f : 0.0f, 14.0f, dt);
 
-        const bool hov_close = mouse.x >= close_pos.x && mouse.x < close_pos.x + close_sz &&
-                               mouse.y >= close_pos.y && mouse.y < close_pos.y + close_sz;
+        dl->AddRectFilled(rmin, rmax, IM_COL32(25, 25, 25, 255), rounding);
+        dl->AddRect(rmin, rmax, IM_COL32(50, 50, 50, 100), rounding);
+        FadedLine(dl, rmin.x, rmax.y - 1.0f, rmax.x - rmin.x, s_row_lit[i]);
 
-        s_close_hover = Approach(s_close_hover, hov_close ? 1.0f : 0.0f, 22.0f, dt);
-        const bool close_held = hov_close && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-        s_close_press = Approach(s_close_press, close_held ? 1.0f : 0.0f, 24.0f, dt);
+        const char* label = kTargets[i].label;
+        const ImVec2 ls = g_font_bold->CalcTextSizeA(g_font_bold->FontSize, FLT_MAX, 0.0f, label);
+        dl->AddText(g_font_bold, g_font_bold->FontSize, ImVec2(rmin.x + kPad, ImFloor(rmin.y + (row_h - ls.y) * 0.5f)),
+                    TextCol(s_row_hover[i], s_row_lit[i]), label);
 
-        if (hov_close && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-            RequestClose();
+        const char* date = ReleaseLabel(i);
+        const ImVec2 ds = g_font_ui->CalcTextSizeA(g_font_ui->FontSize, FLT_MAX, 0.0f, date);
+        dl->AddText(g_font_ui, g_font_ui->FontSize, ImVec2(rmax.x - kPad - ds.x, ImFloor(rmin.y + (row_h - ds.y) * 0.5f)),
+                    IM_COL32(120, 120, 120, 255), date);
 
-        const ImVec2 cc(close_pos.x + close_sz * 0.5f, close_pos.y + close_sz * 0.5f);
-        const char* xglyph = "\xC3\x97";
-        const float close_scale = 1.0f + 0.10f * s_close_press;
-        const ImU32 xc = IM_COL32(255, 255, 255, (int)(180.0f + 75.0f * s_close_hover));
-        const float xsize = 18.0f * close_scale;
-        const ImVec2 xs = ImGui::GetFont()->CalcTextSizeA(xsize, 1000.0f, 0.0f, xglyph);
-        dl->AddText(ImGui::GetFont(), xsize,
-                    ImVec2(cc.x - xs.x * 0.5f + 0.5f, cc.y - xs.y * 0.5f - 0.5f),
-                    xc, xglyph);
-
-        HandleWindowDrag(hwnd, ImVec2(0.0f, 0.0f), ImVec2(close_pos.x - wpos.x, bar_h), !close_held);
+        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            g_target = i;
     }
 
+    const ImVec2 bmin(p.x + kPad, box_max.y + kPad);
+    const ImVec2 bmax(p.x + s.x - kPad, bmin.y + btn_h);
+    const bool hov = !g_settings_open && ImGui::IsMouseHoveringRect(bmin, bmax, false);
+    const bool held = hov && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    s_btn_hover = Approach(s_btn_hover, hov ? 1.0f : 0.0f, 18.0f, dt);
+    s_btn_press = Approach(s_btn_press, held ? 1.0f : 0.0f, 24.0f, dt);
+
+    const int fill = 25 + (int)(5.0f * s_btn_hover);
+    dl->AddRectFilled(bmin, bmax, IM_COL32(fill, fill, fill, 255), rounding);
+    dl->AddRect(bmin, bmax, IM_COL32(50, 50, 50, 100), rounding);
+    FadedLine(dl, bmin.x, bmax.y - 1.0f, bmax.x - bmin.x, s_btn_hover);
+
+    const char* btn_text = "inject";
+    const ImVec2 bs = g_font_bold->CalcTextSizeA(g_font_bold->FontSize, FLT_MAX, 0.0f, btn_text);
+    dl->AddText(g_font_bold, g_font_bold->FontSize,
+                ImVec2(ImFloor(bmin.x + (bmax.x - bmin.x - bs.x) * 0.5f), ImFloor(bmin.y + (btn_h - bs.y) * 0.5f)),
+                TextCol(0.4f + 0.6f * s_btn_hover, s_btn_press), btn_text);
+
+    if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !g_injecting && !g_closing)
     {
-        dl->AddRectFilled(ImVec2(content_l, card_y), ImVec2(content_r, card_b), IM_COL32(7, 7, 7, 255), 0.0f);
-        dl->AddRect(ImVec2(content_l, card_y), ImVec2(content_r, card_b), IM_COL32(28, 28, 28, 255), 0.0f, 0, 1.0f);
-
-        const float item_h = 28.0f;
-        const ImRect item_rect(ImVec2(content_l + 4.0f, card_y + 4.0f),
-                               ImVec2(content_r - 4.0f, card_y + 4.0f + item_h));
-
-        const ImVec2 mouse = ImGui::GetMousePos();
-        const bool hov = mouse.x >= item_rect.Min.x && mouse.x < item_rect.Max.x &&
-                         mouse.y >= item_rect.Min.y && mouse.y < item_rect.Max.y;
-
-        s_item_hover = Approach(s_item_hover, hov ? 1.0f : 0.0f, 22.0f, dt);
-
-        dl->AddRectFilled(item_rect.Min, item_rect.Max, IM_COL32(20, 20, 20, 255), 0.0f);
-        dl->AddRect(item_rect.Min, item_rect.Max, IM_COL32(42, 42, 42, 255), 0.0f, 0, 1.0f);
-
-        const float ind_w = 2.5f;
-        const float ind_h = 13.0f;
-        const float ind_x0 = item_rect.Min.x + 4.0f;
-        const float ind_y0 = item_rect.Min.y + (item_h - ind_h) * 0.5f;
-        dl->AddRectFilled(ImVec2(ind_x0, ind_y0), ImVec2(ind_x0 + ind_w, ind_y0 + ind_h),
-                          IM_COL32(255, 255, 255, 255), 0.0f);
-
-        const float dot_x = item_rect.Max.x - 12.0f;
-        const float dot_y = item_rect.Min.y + item_h * 0.5f;
-        dl->AddCircleFilled(ImVec2(dot_x, dot_y), 4.5f, IM_COL32(255, 255, 255, 24));
-        dl->AddCircleFilled(ImVec2(dot_x, dot_y), 2.2f, IM_COL32(255, 255, 255, 200));
-
-        const ImVec2 label_pos(item_rect.Min.x + 14.0f, item_rect.Min.y + (item_h - ImGui::GetFontSize()) * 0.5f);
-        DrawGlassText(dl, label_pos, IM_COL32(245, 245, 248, 255), "botox", true, false);
-    }
-
-    {
-        const ImRect btn_rect(ImVec2(content_l, btn_y), ImVec2(content_r, btn_y + btn_h));
-        const ImVec2 mouse = ImGui::GetMousePos();
-        const bool hov = mouse.x >= btn_rect.Min.x && mouse.x < btn_rect.Max.x &&
-                         mouse.y >= btn_rect.Min.y && mouse.y < btn_rect.Max.y;
-
-        s_btn_hover = Approach(s_btn_hover, hov ? 1.0f : 0.0f, 22.0f, dt);
-        const bool held = hov && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-        s_btn_press = Approach(s_btn_press, held ? 1.0f : 0.0f, 24.0f, dt);
-
-        const int br = (int)(14.0f + 16.0f * s_btn_hover);
-        const int bg = (int)(14.0f + 16.0f * s_btn_hover);
-        const int bb = (int)(14.0f + 16.0f * s_btn_hover);
-        dl->AddRectFilled(btn_rect.Min, btn_rect.Max, IM_COL32(br, bg, bb, 255), 0.0f);
-        dl->AddRect(btn_rect.Min, btn_rect.Max,
-                    IM_COL32(42 + (int)(30 * s_btn_hover), 42 + (int)(30 * s_btn_hover), 42 + (int)(30 * s_btn_hover), 255),
-                    0.0f, 0, 1.0f);
-
-        const char* btn_text = "inject";
-        const float txt_scale = 1.0f + 0.02f * s_btn_press;
-        const ImVec2 txt_base = ImGui::CalcTextSize(btn_text);
-        const ImVec2 txt_sz(txt_base.x * txt_scale, txt_base.y * txt_scale);
-        const ImU32 txt_col = IM_COL32(245, 245, 250, (int)(220.0f + 35.0f * s_btn_hover));
-
-        DrawGlassText(dl, ImGui::GetFont(), ImGui::GetFontSize() * txt_scale,
-                      ImVec2(btn_rect.Min.x + (content_w - txt_sz.x) * 0.5f,
-                             btn_rect.Min.y + (btn_h - txt_sz.y) * 0.5f + s_btn_press * 1.0f),
-                      txt_col, btn_text, true, false);
-
-        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !g_injecting && !g_closing)
+        g_injecting = true;
+        g_inject_err[0] = 0;
+        g_inject_stage = "downloading";
+        g_inject_ok_at = 0.0f;
+        InterlockedExchange(&g_inject_state, 1);
+        HANDLE thread = ::CreateThread(nullptr, 0, InjectionWorkerThread, (LPVOID)(INT_PTR)g_target, 0, nullptr);
+        if (thread) CloseHandle(thread);
+        else
         {
-            g_injecting = true;
-            g_inject_err[0] = 0;
-            g_inject_ok_at = 0.0f;
-            InterlockedExchange(&g_inject_state, 1);
-            HANDLE thread = ::CreateThread(nullptr, 0, InjectionWorkerThread, nullptr, 0, nullptr);
-            if (thread) CloseHandle(thread);
-            else
-            {
-                lstrcpynA(g_inject_err, "failed to create injection thread", sizeof(g_inject_err));
-                InterlockedExchange(&g_inject_state, 3);
-            }
+            lstrcpynA(g_inject_err, "failed to create injection thread", sizeof(g_inject_err));
+            InterlockedExchange(&g_inject_state, 3);
         }
     }
+}
+
+static void DrawSettings()
+{
+    const float dt = ImMin(ImGui::GetIO().DeltaTime, 1.0f / 30.0f);
+    const float step = dt / (kAnimDuration * 0.5f);
+    g_settings_fade = ImClamp(g_settings_fade + (g_settings_open ? step : -step), 0.0f, 1.0f);
+
+    static int s_active = 0;
+    static bool s_picker = false;
+    static float s_hsv[3] = {};
+    static float s_dpi_edit = 100.0f;
+    static float s_fill = -1.0f;
+    static float s_title = 0.5f, s_acc_hover = 0.0f, s_dpi_hover = 0.0f;
+
+    if (!g_settings_open)
+    {
+        s_picker = false;
+        s_active = 0;
+    }
+    if (g_settings_fade <= 0.0f) return;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetWindowPos();
+    const ImVec2 s = ImGui::GetWindowSize();
+    const float a = g_settings_fade;
+    const ImVec2 mouse = ImGui::GetMousePos();
+    const bool clicked = g_settings_open && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    const bool down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+
+    const ImVec2 pmin(p.x + kPad, p.y + kBandH + kPad);
+    const ImVec2 pmax(p.x + s.x - kPad, p.y + s.y - kBottomBandH - kPad);
+    const float head = ImFloor(S(20.0f));
+    const float line_h = g_font_ui->FontSize;
+
+    dl->AddRectFilled(pmin, pmax, Fade(IM_COL32(20, 20, 20, 255), a), kRounding);
+    dl->AddRectFilled(pmin, ImVec2(pmax.x, pmin.y + head), Fade(IM_COL32(25, 25, 25, 255), a), kRounding, ImDrawFlags_RoundCornersTop);
+    dl->AddRect(pmin, pmax, Fade(IM_COL32(50, 50, 50, 100), a), kRounding);
+
+    const bool panel_hov = ImGui::IsMouseHoveringRect(pmin, pmax, false);
+    s_title = Approach(s_title, panel_hov ? 1.0f : 0.5f, 12.0f, dt);
+    const char* title = "loader settings";
+    const ImVec2 ts = g_font_bold->CalcTextSizeA(g_font_bold->FontSize, FLT_MAX, 0.0f, title);
+    dl->AddText(g_font_bold, g_font_bold->FontSize, ImVec2(ImFloor(pmin.x + (pmax.x - pmin.x - ts.x) * 0.5f), ImFloor(pmin.y + (head - ts.y) * 0.5f)),
+                IM_COL32(255, 255, 255, (int)(255.0f * s_title * a)), title);
+    FadedLine(dl, pmin.x, pmin.y + head, pmax.x - pmin.x, a);
+
+    const float x0 = pmin.x + kPad;
+    const float x1 = pmax.x - kPad;
+    float y = pmin.y + head + kPad;
+
+    if (s_active == 1 && !down)
+    {
+        const float dpi = ImFloor(s_dpi_edit + 0.5f);
+        if (dpi != g_dpi)
+        {
+            g_dpi = dpi;
+            g_scale_dirty = true;
+            SaveSettings();
+        }
+    }
+    if ((s_active == 2 || s_active == 3) && !down)
+        SaveSettings();
+    if (!down)
+        s_active = 0;
+
+    {
+        const char* label = "accent color";
+        const ImVec2 sw_max(x1, y + line_h - S(1.0f));
+        const ImVec2 sw_min(x1 - S(22.0f), sw_max.y - ImFloor(line_h - S(2.0f)));
+        const bool hov = g_settings_open && ImGui::IsMouseHoveringRect(ImVec2(x0, y), ImVec2(x1, y + line_h), false);
+        s_acc_hover = Approach(s_acc_hover, (hov || s_picker) ? 1.0f : 0.0f, 18.0f, dt);
+
+        dl->AddText(g_font_ui, g_font_ui->FontSize, ImVec2(x0, y), IM_COL32(255, 255, 255, (int)(255.0f * (0.5f + 0.5f * s_acc_hover) * a)), label);
+        dl->AddRectFilled(sw_min, sw_max, AccentCol(a), S(2.0f));
+        dl->AddRect(sw_min, sw_max, Fade(IM_COL32(50, 50, 50, 100), a), S(2.0f));
+
+        if (hov && clicked && s_active == 0)
+        {
+            s_picker = !s_picker;
+            ImGui::ColorConvertRGBtoHSV(g_accent[0], g_accent[1], g_accent[2], s_hsv[0], s_hsv[1], s_hsv[2]);
+        }
+        y += line_h + kPad;
+    }
+
+    if (s_picker)
+    {
+        const float hue_w = ImFloor(S(10.0f));
+        const ImVec2 sv_min(x0, y);
+        const ImVec2 sv_max(x1 - hue_w - kGap, pmax.y - kPad);
+        const ImVec2 hue_min(x1 - hue_w, y);
+        const ImVec2 hue_max(x1, sv_max.y);
+
+        if (clicked && s_active == 0)
+        {
+            if (ImGui::IsMouseHoveringRect(sv_min, sv_max, false)) s_active = 2;
+            else if (ImGui::IsMouseHoveringRect(hue_min, hue_max, false)) s_active = 3;
+        }
+        if (s_active == 2)
+        {
+            s_hsv[1] = ImSaturate((mouse.x - sv_min.x) / (sv_max.x - sv_min.x));
+            s_hsv[2] = 1.0f - ImSaturate((mouse.y - sv_min.y) / (sv_max.y - sv_min.y));
+        }
+        else if (s_active == 3)
+        {
+            s_hsv[0] = ImMin(ImSaturate((mouse.y - hue_min.y) / (hue_max.y - hue_min.y)), 0.9999f);
+        }
+        if (s_active == 2 || s_active == 3)
+            ImGui::ColorConvertHSVtoRGB(s_hsv[0], s_hsv[1], s_hsv[2], g_accent[0], g_accent[1], g_accent[2]);
+
+        float hr, hg, hb;
+        ImGui::ColorConvertHSVtoRGB(s_hsv[0], 1.0f, 1.0f, hr, hg, hb);
+        const ImU32 white = Fade(IM_COL32_WHITE, a);
+        const ImU32 hue = ImGui::ColorConvertFloat4ToU32(ImVec4(hr, hg, hb, a));
+        const ImU32 clear = IM_COL32(0, 0, 0, 0);
+        const ImU32 black = Fade(IM_COL32_BLACK, a);
+        dl->AddRectFilledMultiColor(sv_min, sv_max, white, hue, hue, white);
+        dl->AddRectFilledMultiColor(sv_min, sv_max, clear, clear, black, black);
+        dl->AddRect(sv_min, sv_max, Fade(IM_COL32(50, 50, 50, 100), a));
+
+        const float seg = (hue_max.y - hue_min.y) / 6.0f;
+        for (int i = 0; i < 6; ++i)
+        {
+            float r0, g0, b0, r1, g1, b1;
+            ImGui::ColorConvertHSVtoRGB(i / 6.0f, 1.0f, 1.0f, r0, g0, b0);
+            ImGui::ColorConvertHSVtoRGB((i + 1) / 6.0f, 1.0f, 1.0f, r1, g1, b1);
+            const ImU32 c0 = ImGui::ColorConvertFloat4ToU32(ImVec4(r0, g0, b0, a));
+            const ImU32 c1 = ImGui::ColorConvertFloat4ToU32(ImVec4(r1, g1, b1, a));
+            dl->AddRectFilledMultiColor(ImVec2(hue_min.x, hue_min.y + seg * i), ImVec2(hue_max.x, hue_min.y + seg * (i + 1)), c0, c0, c1, c1);
+        }
+        dl->AddRect(hue_min, hue_max, Fade(IM_COL32(50, 50, 50, 100), a));
+
+        const ImVec2 dot(ImLerp(sv_min.x, sv_max.x, s_hsv[1]), ImLerp(sv_min.y, sv_max.y, 1.0f - s_hsv[2]));
+        dl->AddCircle(dot, S(3.5f), black, 12, S(2.0f));
+        dl->AddCircle(dot, S(3.5f), white, 12, S(1.0f));
+        const float hy = ImLerp(hue_min.y, hue_max.y, s_hsv[0]);
+        dl->AddRectFilled(ImVec2(hue_min.x - S(1.0f), hy - S(1.0f)), ImVec2(hue_max.x + S(1.0f), hy + S(1.0f)), white);
+    }
+    else
+    {
+        const char* label = "dpi scale";
+        const ImVec2 bar_min(x0, y + line_h);
+        const ImVec2 bar_max(x1, bar_min.y + ImFloor(line_h - 2.0f));
+        const bool hov = g_settings_open && ImGui::IsMouseHoveringRect(ImVec2(x0, bar_min.y - S(2.0f)), ImVec2(x1, bar_max.y + S(2.0f)), false);
+
+        if (s_active != 1)
+            s_dpi_edit = g_dpi;
+        if (hov && clicked && s_active == 0)
+            s_active = 1;
+        if (s_active == 1)
+            s_dpi_edit = 25.0f + ImSaturate((mouse.x - bar_min.x) / (bar_max.x - bar_min.x)) * 175.0f;
+
+        const float target = (s_dpi_edit - 25.0f) / 175.0f * (bar_max.x - bar_min.x);
+        s_fill = s_fill < 0.0f ? target : Approach(s_fill, target, 14.0f, dt);
+        s_dpi_hover = Approach(s_dpi_hover, (hov || s_active == 1) ? 1.0f : 0.0f, 18.0f, dt);
+        const ImU32 text = IM_COL32(255, 255, 255, (int)(255.0f * (0.5f + 0.5f * s_dpi_hover) * a));
+
+        char value[16];
+        snprintf(value, sizeof(value), "%.0f%%", s_dpi_edit);
+        const ImVec2 vs = g_font_ui->CalcTextSizeA(g_font_ui->FontSize, FLT_MAX, 0.0f, value);
+        dl->AddText(g_font_ui, g_font_ui->FontSize, ImVec2(x0, y - S(1.0f)), text, label);
+        dl->AddText(g_font_ui, g_font_ui->FontSize, ImVec2(x1 - vs.x, y - S(1.0f)), text, value);
+
+        dl->AddRectFilled(bar_min, bar_max, Fade(IM_COL32(25, 25, 25, 255), a), S(2.0f));
+        dl->AddRect(bar_min, bar_max, Fade(IM_COL32(50, 50, 50, 100), a), S(2.0f));
+        if (s_fill > 0.5f)
+            dl->AddRectFilled(bar_min, ImVec2(bar_min.x + s_fill, bar_max.y), AccentCol(a), s_fill > 1.0f ? S(2.0f) : 0.0f);
+    }
+
+    const ImVec2 cog_min(ChromeButtonX(p.x + s.x, 2), p.y);
+    const ImVec2 cog_max(cog_min.x + ChromeButtonW(), p.y + kBandH);
+    const bool on_cog = ImGui::IsMouseHoveringRect(cog_min, cog_max, false);
+    if ((clicked && !panel_hov && !on_cog && s_active == 0) || (g_settings_open && ImGui::IsKeyPressed(ImGuiKey_Escape)))
+        g_settings_open = false;
 }
 
 static void CleanupRenderTarget()
@@ -1385,6 +1668,91 @@ static void CleanupDeviceD3D()
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
 }
 
+// nonzero winding, 4x4 supersampled, white rgba
+static void RasterizePolygon(const float* pts, int count, float view, int size, unsigned char* dst, int pitch)
+{
+    constexpr int kSub = 4;
+    const float unit = view / (float)size;
+    for (int y = 0; y < size; ++y)
+    {
+        for (int x = 0; x < size; ++x)
+        {
+            int hits = 0;
+            for (int sy = 0; sy < kSub; ++sy)
+            {
+                const float py = ((float)y + ((float)sy + 0.5f) / kSub) * unit;
+                for (int sx = 0; sx < kSub; ++sx)
+                {
+                    const float qx = ((float)x + ((float)sx + 0.5f) / kSub) * unit;
+                    int winding = 0;
+                    for (int i = 0, j = count - 1; i < count; j = i++)
+                    {
+                        const float ax = pts[j * 2], ay = pts[j * 2 + 1];
+                        const float bx = pts[i * 2], by = pts[i * 2 + 1];
+                        if ((ay <= py) != (by <= py))
+                        {
+                            const float cx = ax + (py - ay) * (bx - ax) / (by - ay);
+                            if (cx > qx) winding += by > ay ? 1 : -1;
+                        }
+                    }
+                    hits += winding != 0;
+                }
+            }
+            unsigned char* p = dst + (size_t)y * pitch + (size_t)x * 4;
+            p[0] = p[1] = p[2] = 255;
+            p[3] = (unsigned char)(hits * 255 / (kSub * kSub));
+        }
+    }
+}
+
+static void BuildFonts(ImGuiIO& io)
+{
+    static const ImWchar cog_range[] = { 0xf013, 0xf013, 0 };
+
+    io.Fonts->Clear();
+    io.Fonts->FontBuilderIO = ImGuiFreeType::GetBuilderForFreeType();
+    const float size = ImMax(1.0f, ImFloor(S(11.0f) + 0.5f));
+    g_font_ui   = LoadFont(io, "verdana.ttf", size);
+    g_font_bold = LoadFont(io, "verdanab.ttf", size);
+
+    ImFontConfig icon_cfg;
+    g_font_icon = io.Fonts->AddFontFromMemoryCompressedTTF(icon_font_compressed_data, (int)icon_font_compressed_size,
+                                                           ImMax(1.0f, ImFloor(S(13.0f) + 0.5f)), &icon_cfg, cog_range);
+
+    struct icon_src { const float* pts; int count; float size; };
+    const icon_src icons[kIconCount] =
+    {
+        { github_icon_points, IM_ARRAYSIZE(github_icon_points) / 2, 16.0f },
+        { kCloseIconPoints, IM_ARRAYSIZE(kCloseIconPoints) / 2, 24.0f },
+        { kMinimizeIconPoints, IM_ARRAYSIZE(kMinimizeIconPoints) / 2, 24.0f },
+    };
+
+    int sizes[kIconCount] = {};
+    for (int i = 0; i < kIconCount; ++i)
+    {
+        sizes[i] = (int)ImMax(4.0f, ImFloor(S(icons[i].size) + 0.5f));
+        g_icon_rect[i] = io.Fonts->AddCustomRectRegular(sizes[i], sizes[i]);
+    }
+    io.Fonts->Build();
+
+    unsigned char* px = nullptr;
+    int tex_w = 0, tex_h = 0;
+    io.Fonts->GetTexDataAsRGBA32(&px, &tex_w, &tex_h);
+    for (int i = 0; i < kIconCount; ++i)
+        if (const ImFontAtlasCustomRect* r = io.Fonts->GetCustomRectByIndex(g_icon_rect[i]); px && r && r->IsPacked())
+            RasterizePolygon(icons[i].pts, icons[i].count, 24.0f, sizes[i], px + ((size_t)r->Y * tex_w + r->X) * 4, tex_w * 4);
+}
+
+static void ApplyWindowShape(HWND hwnd, bool resize)
+{
+    const int w = WindowW();
+    const int h = WindowH();
+    if (resize)
+        ::SetWindowPos(hwnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const int corner = (int)(kWindowRounding * 2.0f) + 1;
+    ::SetWindowRgn(hwnd, ::CreateRoundRectRgn(0, 0, w + 1, h + 1, corner, corner), TRUE);
+}
+
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1427,15 +1795,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     };
     ::RegisterClassExW(&wc);
 
-    constexpr int kWinW = 260;
-    constexpr int kWinH = 160;
+    LoadSettings();
+    UpdateMetrics();
+
+    const int win_w = WindowW();
+    const int win_h = WindowH();
     const int scr_w = GetSystemMetrics(SM_CXSCREEN);
     const int scr_h = GetSystemMetrics(SM_CYSCREEN);
 
-    HWND hwnd = ::CreateWindowExW(0, wc.lpszClassName, L"botox",
-                                  WS_POPUP,
-                                  (scr_w - kWinW) / 2, (scr_h - kWinH) / 2,
-                                  kWinW, kWinH, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = ::CreateWindowExW(WS_EX_APPWINDOW | WS_EX_LAYERED, wc.lpszClassName, L"botox loader",
+                                  WS_POPUP | WS_MINIMIZEBOX,
+                                  (scr_w - win_w) / 2, (scr_h - win_h) / 2,
+                                  win_w, win_h, nullptr, nullptr, wc.hInstance, nullptr);
+
+    ::SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    ApplyWindowShape(hwnd, false);
+
+    for (int i = 0; i < kTargetCount; ++i)
+        if (HANDLE t = ::CreateThread(nullptr, 0, ReleaseInfoThread, (LPVOID)(INT_PTR)i, 0, nullptr))
+            CloseHandle(t);
 
     if (!CreateDeviceD3D(hwnd))
     {
@@ -1454,23 +1832,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    ImFontConfig font_cfg;
-    font_cfg.FontDataOwnedByAtlas = false;
-    font_cfg.OversampleH = 4;
-    font_cfg.OversampleV = 4;
-    font_cfg.PixelSnapH = false;
-    io.Fonts->AddFontFromMemoryTTF(
-        const_cast<unsigned char*>(embedded_font),
-        (int)embedded_font_size,
-        15.5f,
-        &font_cfg,
-        io.Fonts->GetGlyphRangesCyrillic()
-    );
+    BuildFonts(io);
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 0.0f;
     style.WindowBorderSize = 0.0f;
+    style.WindowPadding = ImVec2(0.0f, 0.0f);
     style.Colors[ImGuiCol_WindowBg] = ImVec4(0, 0, 0, 0);
 
     ImGui_ImplWin32_Init(hwnd);
@@ -1488,18 +1856,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         }
         if (!g_running) break;
 
-        const float fade_dt = ImClamp(io.DeltaTime, 0.0f, 1.0f / 30.0f);
-        if (g_closing)
+        if (::IsIconic(hwnd))
         {
-            g_fade_alpha = Approach(g_fade_alpha, 0.0f, 16.0f, fade_dt);
-            if (g_fade_alpha <= 0.01f)
-                break;
+            if (g_closing) break;
+            ::Sleep(50);
+            continue;
         }
-        else if (g_intro_t < 1.0f)
+
+        const float fade_step = ImClamp(io.DeltaTime, 0.0f, 1.0f / 30.0f) / kAnimDuration;
+        g_fade = ImClamp(g_fade + (g_closing ? -fade_step : fade_step), 0.0f, 1.0f);
+        if (g_closing && g_fade <= 0.0f)
+            break;
+
+        static BYTE s_alpha = 0;
+        const BYTE alpha = (BYTE)(g_fade * 255.0f + 0.5f);
+        if (alpha != s_alpha)
         {
-            g_intro_t += fade_dt / 0.4f;
-            if (g_intro_t > 1.0f) g_intro_t = 1.0f;
-            g_fade_alpha = SmoothStep01(g_intro_t);
+            ::SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+            s_alpha = alpha;
+        }
+
+        if (g_scale_dirty)
+        {
+            g_scale_dirty = false;
+            UpdateMetrics();
+            BuildFonts(io);
+            ImGui_ImplDX11_InvalidateDeviceObjects();
+            ApplyWindowShape(hwnd, true);
         }
 
         ImGui_ImplDX11_NewFrame();
@@ -1523,26 +1906,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             DrawStatusScreen(hwnd);
         else
             DrawGamePanel(hwnd);
+        DrawSettings();
 
         ImGui::End();
 
         ImGui::Render();
         ImDrawData* draw_data = ImGui::GetDrawData();
-
-        if (g_fade_alpha < 0.999f && draw_data)
-        {
-            for (int n = 0; n < draw_data->CmdListsCount; ++n)
-            {
-                ImDrawList* cmd = draw_data->CmdLists[n];
-                for (int i = 0; i < cmd->VtxBuffer.Size; ++i)
-                {
-                    ImDrawVert& v = cmd->VtxBuffer[i];
-                    const ImU32 a = (v.col >> 24) & 0xFF;
-                    const ImU32 na = (ImU32)((float)a * g_fade_alpha);
-                    v.col = (v.col & 0x00FFFFFF) | (na << 24);
-                }
-            }
-        }
 
         const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         g_pd3dContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);

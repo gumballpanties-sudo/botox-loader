@@ -30,3 +30,11 @@
 *.exe
 *.out
 *.app
+
+backups/
+build/
+tests/
+!src/freetype/lib/freetype.lib
+.vs/
+loader/
+x64/
