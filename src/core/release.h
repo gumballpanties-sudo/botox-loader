@@ -21,6 +21,7 @@ namespace release
     {
         std::string sha256;
         std::string updated_at;
+        std::string url;
     };
 
     inline bool find_asset(const std::string& json, const std::string& asset, asset_info& out)
@@ -38,6 +39,7 @@ namespace release
             const std::string digest = json_str(json, "digest", p, end);
             out.sha256 = (digest.size() == 71 && digest.compare(0, 7, "sha256:") == 0) ? digest.substr(7) : std::string();
             out.updated_at = json_str(json, "updated_at", p, end);
+            out.url = json_str(json, "browser_download_url", p, end + 1);
             return true;
         }
         return false;

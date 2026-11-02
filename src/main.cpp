@@ -263,19 +263,13 @@ namespace
         const release_state rs = FetchRelease(target.repo, info);
         const bool got_sha = rs == kRelOk && info.sha256.size() == 64;
         const char* latest_sha = info.sha256.c_str();
+        const bool have_cache = FileHasData(cached) && ValidPeFile(cached);
 
-        if (FileHasData(cached) && ValidPeFile(cached))
+        // cache only skips download when sha proves it is latest; unknown sha = redownload
+        if (have_cache && got_sha)
         {
-            if (got_sha)
-            {
-                char local_sha[65] = {};
-                if (Sha256File(cached, local_sha) && _stricmp(local_sha, latest_sha) == 0)
-                {
-                    lstrcpynA(out_path, cached, (DWORD)cap);
-                    return true;
-                }
-            }
-            else
+            char local_sha[65] = {};
+            if (Sha256File(cached, local_sha) && _stricmp(local_sha, latest_sha) == 0)
             {
                 lstrcpynA(out_path, cached, (DWORD)cap);
                 return true;
@@ -288,8 +282,12 @@ namespace
             return false;
         }
 
-        char url[256]{};
-        snprintf(url, sizeof(url), "https://github.com/%s/releases/latest/download/%s", target.repo, kBotoxDllName);
+        // versioned asset url matches the sha; releases/latest/download can lag behind api
+        char url[512]{};
+        if (rs == kRelOk && info.url.rfind("https://", 0) == 0)
+            lstrcpynA(url, info.url.c_str(), (int)sizeof(url));
+        else
+            snprintf(url, sizeof(url), "https://github.com/%s/releases/latest/download/%s", target.repo, kBotoxDllName);
 
         char part[MAX_PATH * 2 + 8]{};
         snprintf(part, sizeof(part), "%s.part", cached);
@@ -300,14 +298,28 @@ namespace
             if (got_sha)
             {
                 char downloaded_sha[65] = {};
-                if (Sha256File(part, downloaded_sha) && _stricmp(downloaded_sha, latest_sha) != 0)
+                if (!Sha256File(part, downloaded_sha) || _stricmp(downloaded_sha, latest_sha) != 0)
                 {
                     DeleteFileA(part);
                     lstrcpynA(err, "download sha256 mismatch", (int)err_cap);
                     return false;
                 }
             }
-            if (MoveFileExA(part, cached, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            bool moved = MoveFileExA(part, cached, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+            if (!moved)
+            {
+                // old dll still loaded in game = file locked, but rename works on mapped images
+                char old[MAX_PATH * 2 + 8]{};
+                snprintf(old, sizeof(old), "%s.old", cached);
+                DeleteFileA(old);
+                if (MoveFileExA(cached, old, MOVEFILE_REPLACE_EXISTING))
+                {
+                    moved = MoveFileExA(part, cached, MOVEFILE_WRITE_THROUGH) != 0;
+                    if (moved) DeleteFileA(old);
+                    else MoveFileExA(old, cached, 0);
+                }
+            }
+            if (moved)
             {
                 lstrcpynA(out_path, cached, (DWORD)cap);
                 return true;
@@ -315,12 +327,13 @@ namespace
         }
         DeleteFileA(part);
 
-        if (FileHasData(cached) && ValidPeFile(cached))
+        // newer release known = never fall back to old dll; only offline may use cache
+        if (have_cache && !got_sha)
         {
             lstrcpynA(out_path, cached, (DWORD)cap);
             return true;
         }
-        snprintf(err, err_cap, "failed to download %s", target.label);
+        snprintf(err, err_cap, got_sha ? "failed to update %s" : "failed to download %s", target.label);
         return false;
     }
 
