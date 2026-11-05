@@ -1803,7 +1803,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     WNDCLASSEXW wc =
     {
         sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
-        hInstance, nullptr, nullptr, nullptr, nullptr,
+        hInstance, ::LoadIconW(hInstance, MAKEINTRESOURCEW(1)), nullptr, nullptr, nullptr,
         L"botox", nullptr
     };
     ::RegisterClassExW(&wc);

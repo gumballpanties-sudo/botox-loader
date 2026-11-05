@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 $msvc = 'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231'
 $sdkInc = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0'
 $sdkLib = 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0'
+$sdkBin = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0'
 $out = 'build'
 $cl = "$msvc\bin\Hostx64\x64\cl.exe"
 $link = "$msvc\bin\Hostx64\x64\link.exe"
@@ -37,7 +38,12 @@ if ($changed.Count -gt 0) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Set-Content $stampPath -Value $stamp -NoNewline
 }
-$objects = $sources | ForEach-Object { "$out\int\$([System.IO.Path]::GetFileNameWithoutExtension($_)).obj" }
+$res = "$out\int\loader.res"
+if ($force -or (Needs-Build $res @('src\loader.rc','src\icon.ico'))) {
+    & "$sdkBin\x64\rc.exe" /nologo /fo $res src\loader.rc
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+$objects = @($sources | ForEach-Object { "$out\int\$([System.IO.Path]::GetFileNameWithoutExtension($_)).obj" }) + $res
 $needLink = ($changed.Count -gt 0) -or (Needs-Build $exe $objects)
 if ($needLink) {
     $linkArgs = @('/nologo','/SUBSYSTEM:WINDOWS','/MACHINE:X64','/MANIFEST:NO','/INCREMENTAL:NO','/OPT:REF','/OPT:ICF',"/OUT:$exe","/LIBPATH:$msvc\lib\x64","/LIBPATH:$sdkLib\ucrt\x64","/LIBPATH:$sdkLib\um\x64",'d3d11.lib','dxgi.lib','d3dcompiler.lib','winmm.lib','user32.lib','gdi32.lib','wininet.lib','shell32.lib','advapi32.lib','src\freetype\lib\freetype.lib') + $objects
