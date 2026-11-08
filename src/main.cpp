@@ -806,27 +806,27 @@ namespace
         }
 
         const DWORD wait_result = WaitForSingleObject(remote_thread, 30000);
-        if (wait_result == WAIT_TIMEOUT)
+
+        // exit code = low 32 bits of HMODULE on x64 targets, useless as verdict -> check remote module list
+        const char* slash = strrchr(dll_path, '\\');
+        const char* dll_name = slash ? slash + 1 : dll_path;
+        const bool loaded = mmap::RemoteModuleBase(process, mmap::TargetIs64(process), dll_name, nullptr) != 0;
+
+        if (!loaded && err && err_cap)
         {
-            if (err && err_cap) lstrcpynA(err, "LoadLibraryA timed out", (int)err_cap);
-            CloseHandle(remote_thread);
-            CloseHandle(process);
-            return false;
+            DWORD exit_code = 0;
+            GetExitCodeThread(remote_thread, &exit_code);
+            if (wait_result == WAIT_TIMEOUT)
+                lstrcpynA(err, "LoadLibraryA timed out", (int)err_cap);
+            else
+                snprintf(err, err_cap, "dll not loaded (exit 0x%08lx)", exit_code);
         }
 
-        DWORD exit_code = 0;
-        GetExitCodeThread(remote_thread, &exit_code);
-        const bool thread_crashed = exit_code >= 0x80000000u;
-
-        if (thread_crashed && err && err_cap)
-            snprintf(err, err_cap, "LoadLibraryA thread crashed (0x%08lx)", exit_code);
-        else if (exit_code == 0 && err && err_cap)
-            snprintf(err, err_cap, "LoadLibraryA returned 0");
-
-        VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
+        if (wait_result != WAIT_TIMEOUT)
+            VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
         CloseHandle(remote_thread);
         CloseHandle(process);
-        return exit_code != 0 && !thread_crashed;
+        return loaded;
     }
 }
 
