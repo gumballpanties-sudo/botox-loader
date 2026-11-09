@@ -51,6 +51,7 @@ namespace
     {
         { "botox",     "gumballpanties-sudo/botox",     L"csgo.exe",     "",    true  },
         { "botox tf2", "gumballpanties-sudo/botox-tf2", L"tf_win64.exe", "tf2", false },
+        { "botox css", "gumballpanties-sudo/botox-css", L"cstrike_win64.exe", "css", false },
     };
     constexpr int kTargetCount = (int)(sizeof(kTargets) / sizeof(kTargets[0]));
 
